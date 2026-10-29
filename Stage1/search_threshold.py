@@ -26,9 +26,10 @@ def report(args, model, features):
                   }
 
         with torch.no_grad():
-            pred, *_ = model(**inputs)
+            logits, *_ = model(**inputs)
+            # sigmoid(logits) > 0.5 等价于 logits > 0，还原原 get_label 的二值语义
+            pred = (logits > 0).float()
             pred = pred.cpu().numpy()
-            pred[np.isnan(pred)] = 0
             preds.append(pred)
 
     preds = np.concatenate(preds, axis=0).astype(np.float32)
@@ -63,8 +64,8 @@ def evaluate_rcp_on_dev(args, model, dev_features, threshold):
             if logits.dim() != 2 or logits.size(1) != 2:
                 raise ValueError(f"Expected logits shape (N,2), got {logits.shape}")
 
-            # ★ 正确的二分类概率：softmax
-            probs = torch.softmax(logits, dim=1)[:, 1]   # (num_pairs,)
+            # 与 BCE 训练目标一致：取"有关系"列的 sigmoid 概率
+            probs = torch.sigmoid(logits)[:, 1]   # (num_pairs,)
 
             # -------- labels: flatten to pair-level --------
             raw_labels = batch[2]   # List[List[[no_rel, have_rel]]]
@@ -230,7 +231,8 @@ def main():
         pass
     else:  # Testing
         model.load_state_dict(torch.load(args.load_path))
-        thresholds = [0.270, 0.275, 0.280, 0.285, 0.290, 0.295, 0.300, 0.305, 0.310, 0.315, 0.320, 0.330, 0.340]
+        thresholds = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90]
+
         results = grid_search_rcp_threshold(args, model, dev_features, thresholds)
 
 

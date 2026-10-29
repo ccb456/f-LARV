@@ -19,7 +19,9 @@ def train(args, model, train_features, dev_features, test_features):
 
     scaler = GradScaler()
     def finetune(features, optimizer, num_epoch, num_steps):
-        best_score = -1
+        best_recall = -1
+        no_improve = 0          # 连续无 recall 提升的评估次数
+        early_stop = False      # 早停标志
         train_dataloader = DataLoader(features, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn, drop_last=True)
         train_iterator = range(int(num_epoch))
         total_steps = int(len(train_dataloader) * num_epoch // args.gradient_accumulation_steps)
@@ -57,17 +59,28 @@ def train(args, model, train_features, dev_features, test_features):
                     num_steps += 1
                 if (step + 1) == len(train_dataloader) - 1 or (args.evaluation_steps > 0 and num_steps % args.evaluation_steps == 0 and step % args.gradient_accumulation_steps == 0):
                     print({"loss": loss.item()})
-                    dev_score, dev_output, dev_recall = evaluate(args, model, dev_features, tag="dev")
+                    dev_f1, dev_output, dev_recall = evaluate(args, model, dev_features, tag="dev")
                     print(dev_output)
-                    if dev_score > best_score:
-                        best_score = dev_score
-                        print("save result")
+                    # Stage1 是高召回过滤模块，按 recall 保存最佳权重（而非 F1）
+                    if dev_recall > best_recall:
+                        best_recall = dev_recall
+                        no_improve = 0
+                        print("save result (recall-best)")
                         # pred = report(args, model, test_features)
                         # with open("result.json", "w") as fh:
                         #     json.dump(pred, fh)
                         if args.save_path != "":
                             os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
                             torch.save(model.state_dict(), args.save_path)
+                    else:
+                        no_improve += 1
+                        print(f"No recall improvement: {no_improve}/{args.patience}")
+                        if no_improve >= args.patience:
+                            print("Early stopping triggered.")
+                            early_stop = True
+                            break
+            if early_stop:
+                break
         return num_steps
 
     new_layer = ["extractor", "bilinear"]
@@ -98,14 +111,17 @@ def evaluate(args, model, features, tag="dev"):
                   }
 
         with torch.no_grad():
-            pred, *_ = model(**inputs)
+            logits, *_ = model(**inputs)
+            # sigmoid(logits) > 0.5 等价于 logits > 0，还原原 get_label 的二值语义
+            pred = (logits > 0).float()
             pred = pred.cpu().numpy()
-            pred[np.isnan(pred)] = 0
             preds.append(pred)
 
     preds = np.concatenate(preds, axis=0).astype(np.float32)
     ans = to_official(preds, features)
-    best_f1 = 0
+    best_f1 = 0.0
+    re_p = 0.0
+    re_r = 0.0
     if len(ans) > 0:
         best_f1, re_p, re_r = official_evaluate(ans, args.data_dir)
     output = {
@@ -131,9 +147,10 @@ def report(args, model, features):
                   }
 
         with torch.no_grad():
-            pred, *_ = model(**inputs)
+            logits, *_ = model(**inputs)
+            # sigmoid(logits) > 0.5 等价于 logits > 0，还原原 get_label 的二值语义
+            pred = (logits > 0).float()
             pred = pred.cpu().numpy()
-            pred[np.isnan(pred)] = 0
             preds.append(pred)
 
     preds = np.concatenate(preds, axis=0).astype(np.float32)
@@ -181,7 +198,7 @@ def generate_step1_json(
 
             # -------- forward --------
             logits, *_ = model(**inputs)  # (num_pairs_in_batch, 2)
-            probs = torch.softmax(logits, dim=1)[:, 1]  # have_relation prob
+            probs = torch.sigmoid(logits)[:, 1]  # have_relation prob
             probs = probs.cpu()
 
             # -------- split back to document level --------
@@ -229,7 +246,7 @@ def main():
     parser.add_argument("--save_path", default="../model/Re-DocRED/BCE-5/redocred.pt", type=str)
     parser.add_argument("--step_save_dir", default="", type=str)
     # parser.add_argument("--load_path", default="../model/Re-DocRED/Foal-0.2-recall-best/redocred.pt", type=str)
-    parser.add_argument("--load_path", default="../model/Re-DocRED/Focal-0.2-F1-best/redocred.pt", type=str)
+    parser.add_argument("--load_path", default="", type=str)
     
     parser.add_argument("--config_name", default="", type=str,
                         help="Pretrained config name or path if not the same as model_name")
@@ -257,6 +274,8 @@ def main():
                         help="Total number of training epochs to perform.")
     parser.add_argument("--evaluation_steps", default=200, type=int,
                         help="Number of training steps between evaluations.")
+    parser.add_argument("--patience", default=11, type=int,
+                        help="Early stopping: stop after this many consecutive evaluations without recall improvement.")
     parser.add_argument("--seed", type=int, default=66,
                         help="random seed for initialization")
     parser.add_argument("--num_class", type=int, default=2,

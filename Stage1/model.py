@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from opt_einsum import contract
 from long_seq import process_long_input
-from losses import BinaryFocalLoss, Loss
+from losses import BinaryFocalLoss
 
 
 class DocREModel(nn.Module):
@@ -11,7 +11,9 @@ class DocREModel(nn.Module):
         self.config = config
         self.model = model
         self.hidden_size = config.hidden_size
-        self.loss_fnt = Loss()
+        # Focal Loss 缓解实体对二分类的严重类别不平衡（论文式(3)）
+        # 注：若之前的 "Focal-0.2" 指 alpha=0.2，请把 alpha 改为 0.2
+        self.loss_fnt = BinaryFocalLoss(gamma=2.0, alpha=0.25)
 
         self.head_extractor = nn.Linear(2 * config.hidden_size, emb_size)
         self.tail_extractor = nn.Linear(2 * config.hidden_size, emb_size)
@@ -105,7 +107,9 @@ class DocREModel(nn.Module):
         bl = (b1.unsqueeze(3) * b2.unsqueeze(2)).view(-1, self.emb_size * self.block_size)
         logits = self.bilinear(bl)
 
-        output = (self.loss_fnt.get_label(logits),)
+        # 返回原始 logits（连续值），二值化/概率化交由调用方决定，
+        # 避免 get_label 的 0/1 硬标签破坏后续阈值筛选所需的连续置信度。
+        output = (logits,)
         if labels is not None:
             labels = [torch.tensor(label) for label in labels]
             labels = torch.cat(labels, dim=0).to(logits)
